@@ -1526,67 +1526,9 @@ document.addEventListener('click',(e)=>{
 // 複数の公開CORSプロキシを同時に試す（1つが混雑/障害でも他で取得できるようにする）
 // 注意: corsproxy.ioは現在localhost限定の無料プランになり本番環境では使えないため除外。
 // codetabsは?quest=の後ろにURLをそのまま連結する仕様のため、encodeURIComponentで過剰エンコードすると400エラーになる既知の問題がある。
-const CORS_PROXIES=[
-  {label:'AllOrigins',fn:url=>`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`},
-  {label:'CodeTabs',fn:url=>`https://api.codetabs.com/v1/proxy?quest=${encodeURI(url)}`},
-  {label:'CorsX2U',fn:url=>`https://cors.x2u.in/${url}`}
-];
-
-// 1つのプロキシURLに対してfetchを行い、成功したらYahooのchartデータを返す。失敗したらエラー詳細を持ったまま throw。
-async function fetchOneProxy(proxyUrl,timeoutMs,proxyLabel){
-  try{
-    const res=await fetch(proxyUrl,{signal:AbortSignal.timeout(timeoutMs)});
-    if(!res.ok){
-      const bodyText=await res.text().catch(()=>'');
-      throw new Error(`[${proxyLabel}] HTTP ${res.status}`+(bodyText?` (${bodyText.slice(0,80)})`:''));
-    }
-    const text=await res.text();
-    let data;
-    try{
-      data=JSON.parse(text);
-    }catch(parseErr){
-      throw new Error(`[${proxyLabel}] レスポンス解析エラー: ${parseErr.message}`);
-    }
-    const hasError=data&&data.chart&&data.chart.error;
-    const hasResult=data&&data.chart&&data.chart.result&&data.chart.result[0];
-    if(hasError) throw new Error(`[${proxyLabel}] Yahoo APIエラー: ${hasError.description||hasError.code||'不明'}`);
-    if(!hasResult) throw new Error(`[${proxyLabel}] データが空でした`);
-    return data;
-  }catch(e){
-    // fetch自体が失敗した場合（DNS解決失敗・CORSブロック・接続断など）は "Failed to fetch" になりがちなので、プロキシ名を付与してわかりやすくする
-    if(e instanceof TypeError||e.name==='TypeError'){
-      throw new Error(`[${proxyLabel}] 接続失敗 (${e.message})`);
-    }
-    if(e.name==='TimeoutError'||e.name==='AbortError'){
-      throw new Error(`[${proxyLabel}] タイムアウト`);
-    }
-    throw e;
-  }
-}
-
-// 複数のクエリURL×複数のプロキシの全組み合わせを「同時に」リクエストし、
-// 最初に成功したものを採用する（直列で順番に試すより圧倒的に速い）
-// 失敗した場合は全タスクのエラーを集約して返す（AggregateError.errors に各プロキシの詳細が入る）
-async function fetchStockDataFast(queryVariants,timeoutMs){
-  const tasks=[];
-  for(const quoteUrl of queryVariants){
-    for(const proxyFn of CORS_PROXIES){
-      const proxyUrl=proxyFn.fn(quoteUrl);
-      tasks.push(fetchOneProxy(proxyUrl,timeoutMs,proxyFn.label));
-    }
-  }
-  return await Promise.any(tasks);
-}
-
-// ページ読み込み時にCORSプロキシへ軽いダミーリクエストを送り、
-// サーバーレス関数のコールドスタートやDNS/TLS初期化を事前に済ませておく（初回検索の遅延対策）
-function warmupProxies(){
-  const dummyUrl='https://query1.finance.yahoo.com/v8/finance/chart/7203.T?interval=1d&range=1d';
-  CORS_PROXIES.forEach(proxyObj=>{
-    const proxyUrl=proxyObj.fn(dummyUrl);
-    fetch(proxyUrl,{signal:AbortSignal.timeout(10000)}).catch(()=>{}); // 結果は使わない。温めるだけ。
-  });
-}
+// ===== 株価取得：Vercel Serverless Function 経由（サーバー側取得） =====
+// ブラウザのCORS制約を回避するため、自前のサーバーレス関数(/api/stock)を経由する。
+// これにより無料の不安定なCORSプロキシに依存せず、本番環境でも安定して動作する。
 
 // 直近に取得した銘柄データを一時的に保持（同一銘柄の再検索を即時化）
 const stockPriceCache={};
@@ -1603,62 +1545,29 @@ async function fetchStockPrice(code,name,resultElId){
     renderStockDetail(investSearchResult,resultElId);
     return;
   }
-  result.innerHTML=`<div class="loading-spinner">📊 株価情報を取得中... (${code})<br><span style="font-size:11px;color:var(--text5)">初めて検索する銘柄は少し時間がかかることがあります</span></div>`;
+  result.innerHTML=`<div class="loading-spinner">📊 株価情報を取得中... (${code})</div>`;
   try{
-    const symbol=code+'.T';
-    // 日足の終値時系列を取得し、直近の営業日終値と、その前の営業日終値を確実に算出する
-    // 1回目から複数のクエリパターン×複数のプロキシを同時にリクエストし、最初に成功したものを採用
-    // （パターンを増やすことで、特定のYahooエンドポイントが不調でも1回で成功しやすくする）
-    const queryVariants=[
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=10d&region=JP&lang=ja-JP`,
-      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=10d&region=JP&lang=ja-JP`,
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=10d`,
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1mo&region=US&lang=en-US`
-    ];
-    let data;
-    try{
-      data=await fetchStockDataFast(queryVariants,10000);
-    }catch(aggregateErr){
-      // 12タスク全滅した場合のみ、最後の保険として再度試す（一時的なネットワーク不調対策）
-      await new Promise(r=>setTimeout(r,1000));
-      data=await fetchStockDataFast(queryVariants,12000).catch(()=>{throw aggregateErr;});
+    const res=await fetch(`/api/stock?code=${encodeURIComponent(code)}`,{signal:AbortSignal.timeout(12000)});
+    const data=await res.json();
+    if(!res.ok||!data.success){
+      throw new Error(data.error||`HTTP ${res.status}`);
     }
-    const result_=data.chart.result[0];
-    const timestamps=result_.timestamp||[];
-    const closes=(result_.indicators&&result_.indicators.quote&&result_.indicators.quote[0]&&result_.indicators.quote[0].close)||[];
-    // null（休場日・未確定日）を除いた「終値が確定している営業日」だけを古い順に並べる
-    const validDays=[];
-    for(let i=0;i<timestamps.length;i++){
-      if(closes[i]!=null){
-        validDays.push({ts:timestamps[i],close:closes[i]});
-      }
-    }
-    if(validDays.length<2) throw new Error('十分な営業日データがありません');
-    // 直近の営業日が「当日（取引中 or 取引終了済み）」、その前が「一つ前の営業日」
-    const latest=validDays[validDays.length-1];
-    const previous=validDays[validDays.length-2];
-    const price=latest.close;
-    const prevClose=previous.close;
+    const price=data.latest.close;
+    const prevClose=data.previous.close;
     const change=price-prevClose;
     const changePct=(change/prevClose)*100;
-    const latestDateStr=new Date(latest.ts*1000).toLocaleDateString('ja-JP',{timeZone:'Asia/Tokyo',month:'numeric',day:'numeric'});
-    const prevDateStr=new Date(previous.ts*1000).toLocaleDateString('ja-JP',{timeZone:'Asia/Tokyo',month:'numeric',day:'numeric'});
-    investSearchResult={symbol,name,price,prevClose,change,changePct,code,latestDateStr,prevDateStr};
+    const latestDateStr=new Date(data.latest.ts*1000).toLocaleDateString('ja-JP',{timeZone:'Asia/Tokyo',month:'numeric',day:'numeric'});
+    const prevDateStr=new Date(data.previous.ts*1000).toLocaleDateString('ja-JP',{timeZone:'Asia/Tokyo',month:'numeric',day:'numeric'});
+    investSearchResult={symbol:data.symbol,name,price,prevClose,change,changePct,code,latestDateStr,prevDateStr};
     stockPriceCache[code]={data:investSearchResult,ts:Date.now()}; // 取得成功したらキャッシュに保存
     renderStockDetail(investSearchResult,resultElId);
   }catch(e){
-    // AggregateError（全プロキシ失敗時）なら各エラーを列挙、単一エラーならそのまま表示
-    let errorListHtml='';
-    if(e&&e.errors&&e.errors.length){
-      errorListHtml=e.errors.map(err=>`<div style="margin-top:2px">・${(err&&err.message)||String(err)}</div>`).join('');
-    }else{
-      errorListHtml=`<div style="margin-top:2px">・${(e&&e.message)||String(e)||'不明なエラー'}</div>`;
-    }
+    const errMsg=(e&&e.message)||'不明なエラー';
     result.innerHTML=`<div style="color:var(--text4);font-size:13px;text-align:center;padding:10px">
       <div>「${name}」(${code})の株価取得に失敗しました。</div>
       <div style="font-size:11px;margin-top:8px;color:var(--text5);text-align:left;background:rgba(4,9,19,0.5);border-radius:6px;padding:8px">
-        <div style="font-weight:700;margin-bottom:4px">エラー詳細（各経路の結果）:</div>
-        ${errorListHtml}
+        <div style="font-weight:700;margin-bottom:4px">エラー詳細:</div>
+        <div>・${errMsg}</div>
       </div>
       <div style="font-size:11px;margin-top:8px;color:var(--text5)">少し時間を置いて再試行してください。</div>
       <button onclick="fetchStockPrice('${code}','${name.replace(/'/g,"\\'")}','${resultElId}')" style="margin-top:8px;padding:8px 16px;border-radius:8px;font-size:12px;font-weight:700;border:1px solid var(--gold);background:rgba(255,216,77,0.1);color:var(--gold);cursor:pointer">🔄 再試行する</button>
@@ -2148,7 +2057,6 @@ async function init(){
   }catch(e){}
   setTimeout(drawBgChart,100);
   setInterval(updateAccessTime,60000);
-  warmupProxies(); // バックグラウンドでCORSプロキシを事前に「起こしておく」（初回検索の遅延対策）
 }
 async function checkDbTablesExist(){
   try{
